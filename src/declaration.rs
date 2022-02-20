@@ -34,7 +34,7 @@ pub struct DeclarationBlock<'i> {
 }
 
 impl<'i> DeclarationBlock<'i> {
-  pub fn parse<'t>(input: &mut Parser<'i, 't>, options: &ParserOptions) -> Result<Self, ParseError<'i, ParserError<'i>>> {
+  pub fn parse<'t, T>(input: &mut Parser<'i, 't>, options: &ParserOptions<T>) -> Result<Self, ParseError<'i, ParserError<'i>>> {
     let mut important_declarations = DeclarationList::new();
     let mut declarations = DeclarationList::new();
     let mut parser = DeclarationListParser::new(input, PropertyDeclarationParser {
@@ -115,14 +115,14 @@ impl<'i> DeclarationBlock<'i> {
   }
 }
 
-struct PropertyDeclarationParser<'a, 'i> {
+struct PropertyDeclarationParser<'a, 'i, T> {
   important_declarations: &'a mut Vec<Property<'i>>,
   declarations: &'a mut Vec<Property<'i>>,
-  options: &'a ParserOptions
+  options: &'a ParserOptions<T>
 }
 
 /// Parse a declaration within {} block: `color: blue`
-impl<'a, 'i> cssparser::DeclarationParser<'i> for PropertyDeclarationParser<'a, 'i> {
+impl<'a, 'i, T> cssparser::DeclarationParser<'i> for PropertyDeclarationParser<'a, 'i, T> {
   type Declaration = ();
   type Error = ParserError<'i>;
 
@@ -136,18 +136,18 @@ impl<'a, 'i> cssparser::DeclarationParser<'i> for PropertyDeclarationParser<'a, 
 }
 
 /// Default methods reject all at rules.
-impl<'a, 'i> AtRuleParser<'i> for PropertyDeclarationParser<'a, 'i> {
+impl<'a, 'i, T> AtRuleParser<'i> for PropertyDeclarationParser<'a, 'i, T> {
   type Prelude = ();
   type AtRule = ();
   type Error = ParserError<'i>;
 }
 
-pub(crate) fn parse_declaration<'i, 't>(
+pub(crate) fn parse_declaration<'i, 't, T>(
   name: CowRcStr<'i>,
   input: &mut cssparser::Parser<'i, 't>,
   declarations: &mut DeclarationList<'i>,
   important_declarations: &mut DeclarationList<'i>,
-  options: &ParserOptions
+  options: &ParserOptions<T>
 ) -> Result<(), cssparser::ParseError<'i, ParserError<'i>>> {
   let property = input.parse_until_before(Delimiter::Bang, |input| Property::parse(name, input, options))?;
   let important = input.try_parse(|input| {

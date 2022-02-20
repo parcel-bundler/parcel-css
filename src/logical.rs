@@ -65,7 +65,7 @@ impl LogicalProperties {
     }));
   }
 
-  pub fn to_rules(&mut self, dest: &mut CssRuleList) {
+  pub fn to_rules<T>(&mut self, dest: &mut CssRuleList<T>) {
     // Generate rules for [dir="ltr"] and [dir="rtl"] to define --ltr and --rtl vars.
     macro_rules! style_rule {
       ($dir: ident, $ltr: expr, $rtl: expr) => {

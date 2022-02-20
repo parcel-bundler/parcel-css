@@ -1,3 +1,4 @@
+use cssparser::AtRuleParser;
 use parcel_sourcemap::SourceMap;
 use crate::{rules::{Location, layer::{LayerBlockRule, LayerName}}, error::ErrorLocation};
 use std::{fs, path::{Path, PathBuf}, sync::Mutex, collections::HashSet};
@@ -14,17 +15,17 @@ use crate::{
   error::{Error, ParserError}
 };
 
-pub struct Bundler<'a, 's, P> {
+pub struct Bundler<'a, 's, P, T, R> {
   source_map: Option<Mutex<&'s mut SourceMap>>,
   fs: &'a P,
   source_indexes: DashMap<PathBuf, u32>,
-  stylesheets: Mutex<Vec<BundleStyleSheet<'a>>>,
-  options: ParserOptions
+  stylesheets: Mutex<Vec<BundleStyleSheet<'a, T, R>>>,
+  options: ParserOptions<T>
 }
 
 #[derive(Debug)]
-struct BundleStyleSheet<'i> {
-  stylesheet: Option<StyleSheet<'i>>,
+struct BundleStyleSheet<'i, T, R> {
+  stylesheet: Option<StyleSheet<'i, T, R>>,
   dependencies: Vec<u32>,
   parent_source_index: u32,
   parent_dep_index: u32,
@@ -103,8 +104,11 @@ impl<'i> BundleErrorKind<'i> {
   }
 }
 
-impl<'a, 's, P: SourceProvider> Bundler<'a, 's, P> {
-  pub fn new(fs: &'a P, source_map: Option<&'s mut SourceMap>, options: ParserOptions) -> Self {
+impl<'a, 's, P: SourceProvider, T: AtRuleParser<'a> + Clone + Sync + Send> Bundler<'a, 's, P, T, T::AtRule>
+where
+  T::AtRule: Sync + Send + cssparser::ToCss
+{
+  pub fn new(fs: &'a P, source_map: Option<&'s mut SourceMap>, options: ParserOptions<T>) -> Self {
     Bundler {
       source_map: source_map.map(Mutex::new),
       fs,
@@ -114,7 +118,7 @@ impl<'a, 's, P: SourceProvider> Bundler<'a, 's, P> {
     }
   }
 
-  pub fn bundle<'e>(&mut self, entry: &'e Path) -> Result<StyleSheet<'a>, Error<BundleErrorKind<'a>>> {
+  pub fn bundle<'e>(&mut self, entry: &'e Path) -> Result<StyleSheet<'a, T, T::AtRule>, Error<BundleErrorKind<'a>>> {
     // Phase 1: load and parse all files. This is done in parallel.
     self.load_file(&entry, ImportRule {
       url: "".into(),
@@ -132,7 +136,7 @@ impl<'a, 's, P: SourceProvider> Bundler<'a, 's, P> {
     self.order();
 
     // Phase 3: concatenate.
-    let mut rules: Vec<CssRule<'a>> = Vec::new();
+    let mut rules: Vec<CssRule<'a, T::AtRule>> = Vec::new();
     self.inline(&mut rules);
 
     let sources = self.stylesheets.get_mut()
@@ -337,7 +341,7 @@ impl<'a, 's, P: SourceProvider> Bundler<'a, 's, P> {
       &mut HashSet::new()
     );
 
-    fn process(stylesheets: &mut Vec<BundleStyleSheet<'_>>, source_index: u32, visited: &mut HashSet<u32>) {
+    fn process<'a, T: AtRuleParser<'a>>(stylesheets: &mut Vec<BundleStyleSheet<'a, T, T::AtRule>>, source_index: u32, visited: &mut HashSet<u32>) {
       if visited.contains(&source_index) {
         return
       }
@@ -357,14 +361,14 @@ impl<'a, 's, P: SourceProvider> Bundler<'a, 's, P> {
     }
   }
 
-  fn inline(&mut self, dest: &mut Vec<CssRule<'a>>) {
+  fn inline(&mut self, dest: &mut Vec<CssRule<'a, T::AtRule>>) {
     process(
       self.stylesheets.get_mut().unwrap(),
       0,
       dest
     );
 
-    fn process<'a>(stylesheets: &mut Vec<BundleStyleSheet<'a>>, source_index: u32, dest: &mut Vec<CssRule<'a>>) {
+    fn process<'a, T: AtRuleParser<'a>>(stylesheets: &mut Vec<BundleStyleSheet<'a, T, T::AtRule>>, source_index: u32, dest: &mut Vec<CssRule<'a, T::AtRule>>) {
       let stylesheet = &mut stylesheets[source_index as usize];
       let mut rules = std::mem::take(&mut stylesheet.stylesheet.as_mut().unwrap().rules.0);
 

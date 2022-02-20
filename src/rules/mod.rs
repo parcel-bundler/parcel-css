@@ -35,18 +35,18 @@ use crate::prefixes::Feature;
 use crate::targets::Browsers;
 use std::collections::{HashMap, HashSet};
 use crate::selector::{is_equivalent, get_prefix, get_necessary_prefixes};
-use crate::error::{MinifyError, PrinterError};
+use crate::error::{Error, MinifyError, PrinterError, PrinterErrorKind};
 use crate::logical::LogicalProperties;
 use crate::dependencies::{Dependency, ImportDependency};
 use self::layer::{LayerBlockRule, LayerStatementRule};
 
-pub(crate) trait ToCssWithContext<'a, 'i> {
-  fn to_css_with_context<W>(&self, dest: &mut Printer<W>, context: Option<&StyleContext<'a, 'i>>) -> Result<(), PrinterError> where W: std::fmt::Write;
+pub(crate) trait ToCssWithContext<'a, 'i, T> {
+  fn to_css_with_context<W>(&self, dest: &mut Printer<W>, context: Option<&StyleContext<'a, 'i, T>>) -> Result<(), PrinterError> where W: std::fmt::Write;
 }
 
-pub(crate) struct StyleContext<'a, 'i> {
-  pub rule: &'a StyleRule<'i>,
-  pub parent: Option<&'a StyleContext<'a, 'i>>
+pub(crate) struct StyleContext<'a, 'i, T> {
+  pub rule: &'a StyleRule<'i, T>,
+  pub parent: Option<&'a StyleContext<'a, 'i, T>>
 }
 
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
@@ -61,27 +61,28 @@ pub struct Location {
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub enum CssRule<'i> {
-  Media(MediaRule<'i>),
+pub enum CssRule<'i, T> {
+  Media(MediaRule<'i, T>),
   Import(ImportRule<'i>),
-  Style(StyleRule<'i>),
+  Style(StyleRule<'i, T>),
   Keyframes(KeyframesRule<'i>),
   FontFace(FontFaceRule<'i>),
   Page(PageRule<'i>),
-  Supports(SupportsRule<'i>),
+  Supports(SupportsRule<'i, T>),
   CounterStyle(CounterStyleRule<'i>),
   Namespace(NamespaceRule<'i>),
-  MozDocument(MozDocumentRule<'i>),
-  Nesting(NestingRule<'i>),
+  MozDocument(MozDocumentRule<'i, T>),
+  Nesting(NestingRule<'i, T>),
   Viewport(ViewportRule<'i>),
   CustomMedia(CustomMediaRule<'i>),
   LayerStatement(LayerStatementRule<'i>),
-  LayerBlock(LayerBlockRule<'i>),
-  Ignored
+  LayerBlock(LayerBlockRule<'i, T>),
+  Ignored,
+  Custom(T)
 }
 
-impl<'a, 'i> ToCssWithContext<'a, 'i> for CssRule<'i> {
-  fn to_css_with_context<W>(&self, dest: &mut Printer<W>, context: Option<&StyleContext<'a, 'i>>) -> Result<(), PrinterError> where W: std::fmt::Write {
+impl<'a, 'i, T: cssparser::ToCss> ToCssWithContext<'a, 'i, T> for CssRule<'i, T> {
+  fn to_css_with_context<W>(&self, dest: &mut Printer<W>, context: Option<&StyleContext<'a, 'i, T>>) -> Result<(), PrinterError> where W: std::fmt::Write {
     match self {
       CssRule::Media(media) => media.to_css_with_context(dest, context),
       CssRule::Import(import) => import.to_css(dest),
@@ -98,19 +99,20 @@ impl<'a, 'i> ToCssWithContext<'a, 'i> for CssRule<'i> {
       CssRule::CustomMedia(custom_media) => custom_media.to_css(dest),
       CssRule::LayerStatement(layer) => layer.to_css(dest),
       CssRule::LayerBlock(layer) => layer.to_css(dest),
-      CssRule::Ignored => Ok(())
+      CssRule::Ignored => Ok(()),
+      CssRule::Custom(rule) => rule.to_css(dest).map_err(|_| Error { kind: PrinterErrorKind::FmtError, loc: None }),
     }
   }
 }
 
-impl<'i> ToCss for CssRule<'i> {
+impl<'i, T: cssparser::ToCss> ToCss for CssRule<'i, T> {
   fn to_css<W>(&self, dest: &mut Printer<W>) -> Result<(), PrinterError> where W: std::fmt::Write {
     self.to_css_with_context(dest, None)
   }
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct CssRuleList<'i>(pub Vec<CssRule<'i>>);
+pub struct CssRuleList<'i, T>(pub Vec<CssRule<'i, T>>);
 
 pub(crate) struct MinifyContext<'a, 'i> {
   pub targets: &'a Option<Browsers>,
@@ -121,7 +123,7 @@ pub(crate) struct MinifyContext<'a, 'i> {
   pub custom_media: Option<HashMap<CowArcStr<'i>, CustomMediaRule<'i>>>
 }
 
-impl<'i> CssRuleList<'i> {
+impl<'i, T> CssRuleList<'i, T> {
   pub(crate) fn minify(&mut self, context: &mut MinifyContext<'_, 'i>, parent_is_unused: bool) -> Result<(), MinifyError> {
     let mut keyframe_rules = HashMap::new();
     let mut rules = Vec::new();
@@ -240,14 +242,14 @@ impl<'i> CssRuleList<'i> {
   }
 }
 
-impl<'i> ToCss for CssRuleList<'i> {
+impl<'i, T: cssparser::ToCss> ToCss for CssRuleList<'i, T> {
   fn to_css<W>(&self, dest: &mut Printer<W>) -> Result<(), PrinterError> where W: std::fmt::Write {
     self.to_css_with_context(dest, None)
   }
 }
 
-impl<'a, 'i> ToCssWithContext<'a, 'i> for CssRuleList<'i> {
-  fn to_css_with_context<W>(&self, dest: &mut Printer<W>, context: Option<&StyleContext<'a, 'i>>) -> Result<(), PrinterError> where W: std::fmt::Write {
+impl<'a, 'i, T: cssparser::ToCss> ToCssWithContext<'a, 'i, T> for CssRuleList<'i, T> {
+  fn to_css_with_context<W>(&self, dest: &mut Printer<W>, context: Option<&StyleContext<'a, 'i, T>>) -> Result<(), PrinterError> where W: std::fmt::Write {
     let mut first = true;
     let mut last_without_block = false;
 

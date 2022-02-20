@@ -30,12 +30,40 @@ use crate::vendor_prefix::VendorPrefix;
 use std::collections::HashMap;
 use crate::error::ParserError;
 
-#[derive(Default, Clone, Debug)]
-pub struct ParserOptions {
+#[derive(Clone, Debug)]
+pub struct ParserOptions<T> {
   pub nesting: bool,
   pub custom_media: bool,
   pub css_modules: bool,
-  pub source_index: u32
+  pub source_index: u32,
+  pub at_rule_parser: Option<T>
+}
+
+impl ParserOptions<DefaultAtRuleParser> {
+  pub fn default() -> Self {
+    ParserOptions {
+      nesting: false,
+      custom_media: false,
+      css_modules: false,
+      source_index: 0,
+      at_rule_parser: None
+    }
+  }
+}
+
+#[derive(Clone)]
+pub struct DefaultAtRuleParser;
+impl<'i> AtRuleParser<'i> for DefaultAtRuleParser {
+  type AtRule = DefaultAtRule;
+  type Error = ();
+  type Prelude = ();
+}
+
+pub struct DefaultAtRule;
+impl cssparser::ToCss for DefaultAtRule {
+  fn to_css<W>(&self, _: &mut W) -> std::fmt::Result where W: std::fmt::Write {
+    Err(std::fmt::Error)
+  }
 }
 
 #[derive(PartialEq, PartialOrd)]
@@ -48,15 +76,15 @@ enum State {
 }
 
 /// The parser for the top-level rules in a stylesheet.
-pub struct TopLevelRuleParser<'a, 'i> {
+pub struct TopLevelRuleParser<'a, 'i, T> {
   default_namespace: Option<CowArcStr<'i>>,
   namespace_prefixes: HashMap<CowArcStr<'i>, CowArcStr<'i>>,
-  options: &'a ParserOptions,
+  options: &'a mut ParserOptions<T>,
   state: State
 }
 
-impl<'a, 'b, 'i> TopLevelRuleParser<'a, 'i> {
-  pub fn new(options: &'a ParserOptions) -> TopLevelRuleParser<'a, 'i> {
+impl<'a, 'b, 'i, T: AtRuleParser<'i>> TopLevelRuleParser<'a, 'i, T> {
+  pub fn new(options: &'a mut ParserOptions<T>) -> TopLevelRuleParser<'a, 'i, T> {
     TopLevelRuleParser {
       default_namespace: None,
       namespace_prefixes: HashMap::new(),
@@ -65,11 +93,11 @@ impl<'a, 'b, 'i> TopLevelRuleParser<'a, 'i> {
     }
   }
 
-  fn nested<'x: 'b>(&'x mut self) -> NestedRuleParser<'_, 'i> {
+  fn nested<'x: 'b>(&'x mut self) -> NestedRuleParser<'_, 'i, T> {
       NestedRuleParser {
         default_namespace: &mut self.default_namespace,
         namespace_prefixes: &mut self.namespace_prefixes,
-        options: &self.options
+        options: &mut self.options
       }
   }
 }
@@ -77,7 +105,7 @@ impl<'a, 'b, 'i> TopLevelRuleParser<'a, 'i> {
 /// A rule prelude for at-rule with block.
 #[derive(Debug)]
 #[allow(dead_code)]
-pub enum AtRulePrelude<'i> {
+pub enum AtRulePrelude<'i, T> {
   /// A @font-face rule prelude.
   FontFace,
   /// A @font-feature-values rule prelude, with its FamilyName list.
@@ -106,12 +134,13 @@ pub enum AtRulePrelude<'i> {
   Charset,
   /// A @nest prelude.
   Nest(SelectorList<'i, Selectors>),
-  Layer(Vec<LayerName<'i>>)
+  Layer(Vec<LayerName<'i>>),
+  Custom(T)
 }
 
-impl<'a, 'i> AtRuleParser<'i> for TopLevelRuleParser<'a, 'i> {
-  type Prelude = AtRulePrelude<'i>;
-  type AtRule = (SourcePosition, CssRule<'i>);
+impl<'a, 'i, T: AtRuleParser<'i>> AtRuleParser<'i> for TopLevelRuleParser<'a, 'i, T> {
+  type Prelude = AtRulePrelude<'i, T::Prelude>;
+  type AtRule = (SourcePosition, CssRule<'i, T::AtRule>);
   type Error = ParserError<'i>;
 
   fn parse_prelude<'t>(
@@ -192,7 +221,7 @@ impl<'a, 'i> AtRuleParser<'i> for TopLevelRuleParser<'a, 'i> {
   #[inline]
   fn rule_without_block(
       &mut self,
-      prelude: AtRulePrelude<'i>,
+      prelude: AtRulePrelude<'i, T::Prelude>,
       start: &ParserState,
   ) -> Result<Self::AtRule, ()> {
       let loc = start.source_location();
@@ -246,6 +275,10 @@ impl<'a, 'i> AtRuleParser<'i> for TopLevelRuleParser<'a, 'i> {
           AtRuleParser::rule_without_block(&mut self.nested(), prelude, start)?
         },
         AtRulePrelude::Charset => CssRule::Ignored,
+        AtRulePrelude::Custom(_) => {
+          self.state = State::Body;
+          AtRuleParser::rule_without_block(&mut self.nested(), prelude, start)?
+        },
         _ => return Err(())
       };
 
@@ -253,9 +286,9 @@ impl<'a, 'i> AtRuleParser<'i> for TopLevelRuleParser<'a, 'i> {
   }
 }
 
-impl<'a, 'i> QualifiedRuleParser<'i> for TopLevelRuleParser<'a, 'i> {
+impl<'a, 'i, T: AtRuleParser<'i>> QualifiedRuleParser<'i> for TopLevelRuleParser<'a, 'i, T> {
   type Prelude = SelectorList<'i, Selectors>;
-  type QualifiedRule = (SourcePosition, CssRule<'i>);
+  type QualifiedRule = (SourcePosition, CssRule<'i, T::AtRule>);
   type Error = ParserError<'i>;
 
   #[inline]
@@ -279,15 +312,14 @@ impl<'a, 'i> QualifiedRuleParser<'i> for TopLevelRuleParser<'a, 'i> {
   }
 }
 
-#[derive(Clone)]
-struct NestedRuleParser<'a, 'i> {
+struct NestedRuleParser<'a, 'i, T> {
   default_namespace: &'a Option<CowArcStr<'i>>,
   namespace_prefixes: &'a HashMap<CowArcStr<'i>, CowArcStr<'i>>,
-  options: &'a ParserOptions
+  options: &'a mut ParserOptions<T>
 }
 
-impl<'a, 'b, 'i> NestedRuleParser<'a, 'i> {
-  fn parse_nested_rules<'t>(&mut self, input: &mut Parser<'i, 't>) -> CssRuleList<'i> {
+impl<'a, 'b, 'i, T: AtRuleParser<'i>> NestedRuleParser<'a, 'i, T> {
+  fn parse_nested_rules<'t>(&mut self, input: &mut Parser<'i, 't>) -> CssRuleList<'i, T::AtRule> {
     let nested_parser = NestedRuleParser {
       default_namespace: self.default_namespace,
       namespace_prefixes: self.namespace_prefixes,
@@ -319,9 +351,9 @@ impl<'a, 'b, 'i> NestedRuleParser<'a, 'i> {
   }
 }
 
-impl<'a, 'b, 'i> AtRuleParser<'i> for NestedRuleParser<'a, 'i> {
-  type Prelude = AtRulePrelude<'i>;
-  type AtRule = CssRule<'i>;
+impl<'a, 'b, 'i, T: AtRuleParser<'i>> AtRuleParser<'i> for NestedRuleParser<'a, 'i, T> {
+  type Prelude = AtRulePrelude<'i, T::Prelude>;
+  type AtRule = CssRule<'i, T::AtRule>;
   type Error = ParserError<'i>;
 
   fn parse_prelude<'t>(
@@ -403,7 +435,15 @@ impl<'a, 'b, 'i> AtRuleParser<'i> for NestedRuleParser<'a, 'i> {
         };
         Ok(AtRulePrelude::Layer(names))
       },
-      _ => Err(input.new_error(BasicParseErrorKind::AtRuleInvalid(name)))
+      _ => {
+        if let Some(at_rule_parser) = &mut self.options.at_rule_parser {
+          at_rule_parser.parse_prelude(name.clone(), input)
+            .map(|prelude| AtRulePrelude::Custom(prelude))
+            .map_err(|_| input.new_error(BasicParseErrorKind::AtRuleInvalid(name)))
+        } else {
+          Err(input.new_error(BasicParseErrorKind::AtRuleInvalid(name)))
+        }
+      }
     }
   }
 
@@ -412,7 +452,7 @@ impl<'a, 'b, 'i> AtRuleParser<'i> for NestedRuleParser<'a, 'i> {
     prelude: Self::Prelude,
     start: &ParserState,
     input: &mut Parser<'i, 't>,
-  ) -> Result<CssRule<'i>, ParseError<'i, Self::Error>> {
+  ) -> Result<CssRule<'i, T::AtRule>, ParseError<'i, Self::Error>> {
     let loc = self.loc(start);
     match prelude {
       AtRulePrelude::FontFace => {
@@ -518,14 +558,23 @@ impl<'a, 'b, 'i> AtRuleParser<'i> for NestedRuleParser<'a, 'i> {
         // These rules don't have blocks.
         Err(input.new_unexpected_token_error(Token::CurlyBracketBlock))
       },
-      AtRulePrelude::FontFeatureValues | AtRulePrelude::Nest(..) => unreachable!()
+      AtRulePrelude::FontFeatureValues | AtRulePrelude::Nest(..) => unreachable!(),
+      AtRulePrelude::Custom(prelude) => {
+        if let Some(at_rule_parser) = &mut self.options.at_rule_parser {
+          at_rule_parser.parse_block(prelude, start, input)
+            .map(|prelude| CssRule::Custom(prelude))
+            .map_err(|_| input.new_error(BasicParseErrorKind::AtRuleBodyInvalid))
+        } else {
+          Err(input.new_error(BasicParseErrorKind::AtRuleBodyInvalid))
+        }
+      }
     }
   }
 
   #[inline]
   fn rule_without_block(
     &mut self,
-    prelude: AtRulePrelude<'i>,
+    prelude: AtRulePrelude<'i, T::Prelude>,
     start: &ParserState,
   ) -> Result<Self::AtRule, ()> {
     let loc = self.loc(start);
@@ -540,14 +589,22 @@ impl<'a, 'b, 'i> AtRuleParser<'i> for NestedRuleParser<'a, 'i> {
           loc
         }))
       }
+      AtRulePrelude::Custom(prelude) => {
+        if let Some(at_rule_parser) = &mut self.options.at_rule_parser {
+          at_rule_parser.rule_without_block(prelude, start)
+            .map(|prelude| CssRule::Custom(prelude))
+        } else {
+          Err(())
+        }
+      }
       _ => Err(())
     }
   }
 }
 
-impl<'a, 'b, 'i> QualifiedRuleParser<'i> for NestedRuleParser<'a, 'i> {
+impl<'a, 'b, 'i, T: AtRuleParser<'i>> QualifiedRuleParser<'i> for NestedRuleParser<'a, 'i, T> {
   type Prelude = SelectorList<'i, Selectors>;
-  type QualifiedRule = CssRule<'i>;
+  type QualifiedRule = CssRule<'i, T::AtRule>;
   type Error = ParserError<'i>;
 
   fn parse_prelude<'t>(
@@ -568,7 +625,7 @@ impl<'a, 'b, 'i> QualifiedRuleParser<'i> for NestedRuleParser<'a, 'i> {
     selectors: Self::Prelude,
     start: &ParserState,
     input: &mut Parser<'i, 't>,
-  ) -> Result<CssRule<'i>, ParseError<'i, Self::Error>> {
+  ) -> Result<CssRule<'i, T::AtRule>, ParseError<'i, Self::Error>> {
     let loc = self.loc(start);
     let (declarations, rules) = if self.options.nesting {
       parse_declarations_and_nested_rules(input, self.default_namespace, self.namespace_prefixes, self.options)?
@@ -585,12 +642,12 @@ impl<'a, 'b, 'i> QualifiedRuleParser<'i> for NestedRuleParser<'a, 'i> {
   }
 }
 
-fn parse_declarations_and_nested_rules<'a, 'i, 't>(
+fn parse_declarations_and_nested_rules<'a, 'i, 't, T: AtRuleParser<'i>>(
   input: &mut Parser<'i, 't>,
   default_namespace: &'a Option<CowArcStr<'i>>,
   namespace_prefixes: &'a HashMap<CowArcStr<'i>, CowArcStr<'i>>,
-  options: &'a ParserOptions
-) -> Result<(DeclarationBlock<'i>, CssRuleList<'i>), ParseError<'i, ParserError<'i>>> {
+  options: &'a mut ParserOptions<T>
+) -> Result<(DeclarationBlock<'i>, CssRuleList<'i, T::AtRule>), ParseError<'i, ParserError<'i>>> {
   let mut important_declarations = DeclarationList::new();
   let mut declarations = DeclarationList::new();
   let mut rules = CssRuleList(vec![]);
@@ -627,17 +684,17 @@ fn parse_declarations_and_nested_rules<'a, 'i, 't>(
   Ok((DeclarationBlock { declarations, important_declarations }, rules))
 }
 
-pub struct StyleRuleParser<'a, 'i> {
+pub struct StyleRuleParser<'a, 'i, T, R> {
   default_namespace: &'a Option<CowArcStr<'i>>,
   namespace_prefixes: &'a HashMap<CowArcStr<'i>, CowArcStr<'i>>,
-  options: &'a ParserOptions,
+  options: &'a mut ParserOptions<T>,
   declarations: &'a mut DeclarationList<'i>,
   important_declarations: &'a mut DeclarationList<'i>,
-  rules: &'a mut CssRuleList<'i>
+  rules: &'a mut CssRuleList<'i, R>
 }
 
 /// Parse a declaration within {} block: `color: blue`
-impl<'a, 'i> cssparser::DeclarationParser<'i> for StyleRuleParser<'a, 'i> {
+impl<'a, 'i, T: AtRuleParser<'i>> cssparser::DeclarationParser<'i> for StyleRuleParser<'a, 'i, T, T::AtRule> {
   type Declaration = ();
   type Error = ParserError<'i>;
 
@@ -654,8 +711,8 @@ impl<'a, 'i> cssparser::DeclarationParser<'i> for StyleRuleParser<'a, 'i> {
   }
 }
 
-impl<'a, 'i> AtRuleParser<'i> for StyleRuleParser<'a, 'i> {
-  type Prelude = AtRulePrelude<'i>;
+impl<'a, 'i, T: AtRuleParser<'i>> AtRuleParser<'i> for StyleRuleParser<'a, 'i, T, T::AtRule> {
+  type Prelude = AtRulePrelude<'i, T::Prelude>;
   type AtRule = ();
   type Error = ParserError<'i>;
 
@@ -683,13 +740,21 @@ impl<'a, 'i> AtRuleParser<'i> for StyleRuleParser<'a, 'i> {
         let selectors = SelectorList::parse(&selector_parser, input, NestingRequirement::Contained)?;
         Ok(AtRulePrelude::Nest(selectors))
       },
-      _ => Err(input.new_error(BasicParseErrorKind::AtRuleInvalid(name)))
+      _ => {
+        if let Some(at_rule_parser) = &mut self.options.at_rule_parser {
+          at_rule_parser.parse_prelude(name.clone(), input)
+            .map(|prelude| AtRulePrelude::Custom(prelude))
+            .map_err(|_| input.new_error(BasicParseErrorKind::AtRuleInvalid(name)))
+        } else {
+          Err(input.new_error(BasicParseErrorKind::AtRuleInvalid(name)))
+        }
+      }
     }
   }
 
   fn parse_block<'t>(
     &mut self,
-    prelude: AtRulePrelude<'i>,
+    prelude: AtRulePrelude<'i, T::Prelude>,
     start: &ParserState,
     input: &mut Parser<'i, 't>,
   ) -> Result<(), ParseError<'i, Self::Error>> {
@@ -730,22 +795,49 @@ impl<'a, 'i> AtRuleParser<'i> for StyleRuleParser<'a, 'i> {
         }));
         Ok(())
       },
-      _ => {
-        println!("{:?}", prelude);
-        unreachable!()
+      AtRulePrelude::Custom(prelude) => {
+        if let Some(at_rule_parser) = &mut self.options.at_rule_parser {
+          let rule = at_rule_parser.parse_block(prelude, start, input)
+            .map_err(|_| input.new_error(BasicParseErrorKind::AtRuleBodyInvalid))?;
+          self.rules.0.push(CssRule::Custom(rule));
+          Ok(())
+        } else {
+          Err(input.new_error(BasicParseErrorKind::AtRuleBodyInvalid))
+        }
+      },
+      _ => Err(input.new_error(BasicParseErrorKind::AtRuleBodyInvalid))
+    }
+  }
+
+  #[inline]
+  fn rule_without_block(
+    &mut self,
+    prelude: AtRulePrelude<'i, T::Prelude>,
+    start: &ParserState,
+  ) -> Result<Self::AtRule, ()> {
+    match prelude {
+      AtRulePrelude::Custom(prelude) => {
+        if let Some(at_rule_parser) = &mut self.options.at_rule_parser {
+          let rule = at_rule_parser.rule_without_block(prelude, start)?;
+          self.rules.0.push(CssRule::Custom(rule));
+          Ok(())
+        } else {
+          Err(())
+        }
       }
+      _ => Err(())
     }
   }
 }
 
 #[inline]
-fn parse_nested_at_rule<'a, 'i, 't>(
+fn parse_nested_at_rule<'a, 'i, 't, T: AtRuleParser<'i>>(
   input: &mut Parser<'i, 't>,
   source_index: u32,
   default_namespace: &'a Option<CowArcStr<'i>>,
   namespace_prefixes: &'a HashMap<CowArcStr<'i>, CowArcStr<'i>>,
-  options: &'a ParserOptions
-) -> Result<CssRuleList<'i>, ParseError<'i, ParserError<'i>>> {
+  options: &'a mut ParserOptions<T>
+) -> Result<CssRuleList<'i, T::AtRule>, ParseError<'i, ParserError<'i>>> {
   let loc = input.current_source_location();
   let loc = Location { source_index, line: loc.line, column: loc.column };
 
@@ -766,7 +858,7 @@ fn parse_nested_at_rule<'a, 'i, 't>(
   Ok(rules)
 }
 
-impl<'a, 'b, 'i> QualifiedRuleParser<'i> for StyleRuleParser<'a, 'i> {
+impl<'a, 'b, 'i, T: AtRuleParser<'i>> QualifiedRuleParser<'i> for StyleRuleParser<'a, 'i, T, T::AtRule> {
   type Prelude = SelectorList<'i, Selectors>;
   type QualifiedRule = ();
   type Error = ParserError<'i>;

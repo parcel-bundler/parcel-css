@@ -1,4 +1,4 @@
-use crate::values::string::CowArcStr;
+use crate::{values::string::CowArcStr, parser::DefaultAtRule};
 use cssparser::*;
 use parcel_selectors::{SelectorList, parser::{SelectorImpl, Selector, Combinator, Component}, attr::{AttrSelectorOperator, ParsedAttrSelectorOperation, ParsedCaseSensitivity}};
 use std::fmt;
@@ -69,7 +69,7 @@ impl<'i> SelectorImpl<'i> for Selectors {
 
   fn to_css<W: fmt::Write>(selectors: &SelectorList<'i, Self>, dest: &mut W) -> std::fmt::Result {
     let mut printer = Printer::new(dest, None, false, None);
-    serialize_selector_list(selectors.0.iter(), &mut printer, None).map_err(|_| std::fmt::Error)
+    serialize_selector_list::<_, _, DefaultAtRule>(selectors.0.iter(), &mut printer, None).map_err(|_| std::fmt::Error)
   }
 }
 
@@ -334,8 +334,8 @@ impl<'i> cssparser::ToCss for PseudoClass<'i> {
   }
 }
 
-impl<'a, 'i> ToCssWithContext<'a, 'i> for PseudoClass<'i> {
-  fn to_css_with_context<W>(&self, dest: &mut Printer<W>, context: Option<&StyleContext<'a, 'i>>) -> Result<(), PrinterError> where W: fmt::Write {
+impl<'a, 'i, T> ToCssWithContext<'a, 'i, T> for PseudoClass<'i> {
+  fn to_css_with_context<W>(&self, dest: &mut Printer<W>, context: Option<&StyleContext<'a, 'i, T>>) -> Result<(), PrinterError> where W: fmt::Write {
       use PseudoClass::*;
       match &self {
         Lang(lang) => {
@@ -658,8 +658,8 @@ impl<'i> PseudoElement<'i> {
   }
 }
 
-impl<'a, 'i> ToCssWithContext<'a, 'i> for SelectorList<'i, Selectors> {
-  fn to_css_with_context<W>(&self, dest: &mut Printer<W>, context: Option<&StyleContext<'a, 'i>>)-> Result<(), PrinterError> where W: fmt::Write {
+impl<'a, 'i, T> ToCssWithContext<'a, 'i, T> for SelectorList<'i, Selectors> {
+  fn to_css_with_context<W>(&self, dest: &mut Printer<W>, context: Option<&StyleContext<'a, 'i, T>>)-> Result<(), PrinterError> where W: fmt::Write {
     serialize_selector_list(self.0.iter(), dest, context)
   }
 }
@@ -680,8 +680,8 @@ impl ToCss for Combinator {
 }
 
 // Copied from the selectors crate and modified to override to_css implementation.
-impl<'a, 'i> ToCssWithContext<'a, 'i> for parcel_selectors::parser::Selector<'i, Selectors> {
-  fn to_css_with_context<W>(&self, dest: &mut Printer<W>, context: Option<&StyleContext<'a, 'i>>)-> Result<(), PrinterError>
+impl<'a, 'i, T> ToCssWithContext<'a, 'i, T> for parcel_selectors::parser::Selector<'i, Selectors> {
+  fn to_css_with_context<W>(&self, dest: &mut Printer<W>, context: Option<&StyleContext<'a, 'i, T>>)-> Result<(), PrinterError>
   where
       W: fmt::Write,
   {
@@ -841,8 +841,8 @@ impl<'a, 'i> ToCssWithContext<'a, 'i> for parcel_selectors::parser::Selector<'i,
   }
 }
 
-impl<'a, 'i> ToCssWithContext<'a, 'i> for Component<'i, Selectors> {
-  fn to_css_with_context<W>(&self, dest: &mut Printer<W>, context: Option<&StyleContext<'a, 'i>>)-> Result<(), PrinterError> where W: fmt::Write {
+impl<'a, 'i, T> ToCssWithContext<'a, 'i, T> for Component<'i, Selectors> {
+  fn to_css_with_context<W>(&self, dest: &mut Printer<W>, context: Option<&StyleContext<'a, 'i, T>>)-> Result<(), PrinterError> where W: fmt::Write {
     use Component::*;
     match &self {
       Combinator(ref c) => c.to_css(dest),
@@ -922,7 +922,7 @@ impl<'a, 'i> ToCssWithContext<'a, 'i> for Component<'i, Selectors> {
   }
 }
 
-fn serialize_nesting<W>(dest: &mut Printer<W>, context: Option<&StyleContext>, first: bool)-> Result<(), PrinterError> where W: fmt::Write {
+fn serialize_nesting<W, T>(dest: &mut Printer<W>, context: Option<&StyleContext<T>>, first: bool)-> Result<(), PrinterError> where W: fmt::Write {
   if let Some(ctx) = context {
     // If there's only one simple selector, just serialize it directly.
     // Otherwise, use an :is() pseudo class.
@@ -978,7 +978,7 @@ fn is_namespace(component: Option<&Component<Selectors>>) -> bool {
   )
 }
 
-fn serialize_selector_list<'a, 'i: 'a, I, W>(iter: I, dest: &mut Printer<W>, context: Option<&StyleContext<'_, 'i>>)-> Result<(), PrinterError>
+fn serialize_selector_list<'a, 'i: 'a, I, W, T>(iter: I, dest: &mut Printer<W>, context: Option<&StyleContext<'_, 'i, T>>)-> Result<(), PrinterError>
 where
     I: Iterator<Item = &'a Selector<'i, Selectors>>,
     W: fmt::Write,

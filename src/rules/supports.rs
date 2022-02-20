@@ -8,20 +8,20 @@ use crate::rules::{ToCssWithContext, StyleContext};
 use crate::error::{ParserError, MinifyError, PrinterError};
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct SupportsRule<'i> {
+pub struct SupportsRule<'i, T> {
   pub condition: SupportsCondition<'i>,
-  pub rules: CssRuleList<'i>,
+  pub rules: CssRuleList<'i, T>,
   pub loc: Location
 }
 
-impl<'i> SupportsRule<'i> {
+impl<'i, T> SupportsRule<'i, T> {
   pub(crate) fn minify(&mut self, context: &mut MinifyContext<'_, 'i>, parent_is_unused: bool) -> Result<(), MinifyError> {
     self.rules.minify(context, parent_is_unused)
   }
 }
 
-impl<'a, 'i> ToCssWithContext<'a, 'i> for SupportsRule<'i> {
-  fn to_css_with_context<W>(&self, dest: &mut Printer<W>, context: Option<&StyleContext<'a, 'i>>) -> Result<(), PrinterError> where W: std::fmt::Write {
+impl<'a, 'i, T: cssparser::ToCss> ToCssWithContext<'a, 'i, T> for SupportsRule<'i, T> {
+  fn to_css_with_context<W>(&self, dest: &mut Printer<W>, context: Option<&StyleContext<'a, 'i, T>>) -> Result<(), PrinterError> where W: std::fmt::Write {
     dest.add_mapping(self.loc);
     dest.write_str("@supports ")?;
     self.condition.to_css(dest)?;

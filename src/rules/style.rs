@@ -12,15 +12,15 @@ use crate::error::{PrinterError, PrinterErrorKind, MinifyError};
 use super::MinifyContext;
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct StyleRule<'i> {
+pub struct StyleRule<'i, T> {
   pub selectors: SelectorList<'i, Selectors>,
   pub vendor_prefix: VendorPrefix,
   pub declarations: DeclarationBlock<'i>,
-  pub rules: CssRuleList<'i>,
+  pub rules: CssRuleList<'i, T>,
   pub loc: Location
 }
 
-impl<'i> StyleRule<'i> {
+impl<'i, T> StyleRule<'i, T> {
   pub(crate) fn minify(&mut self, context: &mut MinifyContext<'_, 'i>, parent_is_unused: bool) -> Result<bool, MinifyError> {
     let mut unused = false;
     if !context.unused_symbols.is_empty() {
@@ -52,8 +52,8 @@ impl<'i> StyleRule<'i> {
   }
 }
 
-impl<'a, 'i> ToCssWithContext<'a, 'i> for StyleRule<'i> {
-  fn to_css_with_context<W>(&self, dest: &mut Printer<W>, context: Option<&StyleContext<'a, 'i>>) -> Result<(), PrinterError> where W: std::fmt::Write {
+impl<'a, 'i, T: cssparser::ToCss> ToCssWithContext<'a, 'i, T> for StyleRule<'i, T> {
+  fn to_css_with_context<W>(&self, dest: &mut Printer<W>, context: Option<&StyleContext<'a, 'i, T>>) -> Result<(), PrinterError> where W: std::fmt::Write {
     if self.vendor_prefix.is_empty() {
       self.to_css_base(dest, context)
     } else {
@@ -88,8 +88,8 @@ impl<'a, 'i> ToCssWithContext<'a, 'i> for StyleRule<'i> {
   }
 }
 
-impl<'a, 'i> StyleRule<'i> {
-  fn to_css_base<W>(&self, dest: &mut Printer<W>, context: Option<&StyleContext<'a, 'i>>) -> Result<(), PrinterError> where W: std::fmt::Write {
+impl<'a, 'i, T: cssparser::ToCss> StyleRule<'i, T> {
+  fn to_css_base<W>(&self, dest: &mut Printer<W>, context: Option<&StyleContext<'a, 'i, T>>) -> Result<(), PrinterError> where W: std::fmt::Write {
     // If supported, or there are no targets, preserve nesting. Otherwise, write nested rules after parent.
     let supports_nesting = self.rules.0.is_empty() || dest.targets.is_none() || Feature::CssNesting.is_compatible(dest.targets.unwrap());
     let len = self.declarations.declarations.len() + self.declarations.important_declarations.len();

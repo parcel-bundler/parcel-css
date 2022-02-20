@@ -84,13 +84,13 @@ impl<'i> ToCss for LayerStatementRule<'i> {
 
 /// https://drafts.csswg.org/css-cascade-5/#layer-block
 #[derive(Debug, Clone, PartialEq)]
-pub struct LayerBlockRule<'i> {
+pub struct LayerBlockRule<'i, T> {
   pub name: Option<LayerName<'i>>,
-  pub rules: CssRuleList<'i>,
+  pub rules: CssRuleList<'i, T>,
   pub loc: Location
 }
 
-impl<'i> ToCss for LayerBlockRule<'i> {
+impl<'i, T: cssparser::ToCss> ToCss for LayerBlockRule<'i, T> {
   fn to_css<W>(&self, dest: &mut Printer<W>) -> Result<(), PrinterError> where W: std::fmt::Write {
     dest.add_mapping(self.loc);
     dest.write_str("@layer")?;

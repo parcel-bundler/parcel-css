@@ -5,18 +5,18 @@ use super::{CssRuleList, MinifyContext};
 use crate::error::{MinifyError, PrinterError};
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct MozDocumentRule<'i> {
-  pub rules: CssRuleList<'i>,
+pub struct MozDocumentRule<'i, T> {
+  pub rules: CssRuleList<'i, T>,
   pub loc: Location
 }
 
-impl<'i> MozDocumentRule<'i> {
+impl<'i, T> MozDocumentRule<'i, T> {
   pub(crate) fn minify(&mut self, context: &mut MinifyContext<'_, 'i>) -> Result<(), MinifyError> {
     self.rules.minify(context, false)
   }
 }
 
-impl<'i> ToCss for MozDocumentRule<'i> {
+impl<'i, T: cssparser::ToCss> ToCss for MozDocumentRule<'i, T> {
   fn to_css<W>(&self, dest: &mut Printer<W>) -> Result<(), PrinterError> where W: std::fmt::Write {
     dest.add_mapping(self.loc);
     dest.write_str("@-moz-document url-prefix()")?;

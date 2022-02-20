@@ -293,7 +293,7 @@ macro_rules! define_properties {
     }
 
     impl<'i> Property<'i> {
-      pub fn parse<'t>(name: CowRcStr<'i>, input: &mut Parser<'i, 't>, options: &ParserOptions) -> Result<Property<'i>, ParseError<'i, ParserError<'i>>> {
+      pub fn parse<'t, T>(name: CowRcStr<'i>, input: &mut Parser<'i, 't>, options: &ParserOptions<T>) -> Result<Property<'i>, ParseError<'i, ParserError<'i>>> {
         let state = input.state();
         let name_ref = name.as_ref();
         let (prefix, name_ref) = if starts_with_ignore_ascii_case(name_ref, "-webkit-") {
@@ -460,6 +460,12 @@ macro_rules! define_properties {
         write!(VendorPrefix::O);
         write!(VendorPrefix::None);
         Ok(())
+      }
+
+      // TODO: temp
+      pub fn temp_to_css<W>(&self, dest: &mut W, important: bool) -> std::fmt::Result where W: std::fmt::Write {
+        let mut printer = Printer::new(dest, None, false, None);
+        self.to_css(&mut printer, important).map_err(|_| std::fmt::Error)
       }
     }
   };

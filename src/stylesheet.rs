@@ -1,4 +1,4 @@
-use cssparser::{Parser, ParserInput, RuleListParser};
+use cssparser::{Parser, ParserInput, RuleListParser, AtRuleParser};
 use parcel_sourcemap::SourceMap;
 use crate::rules::{CssRule, CssRuleList, MinifyContext};
 use crate::parser::TopLevelRuleParser;
@@ -17,10 +17,10 @@ pub use crate::parser::ParserOptions;
 pub use crate::printer::PseudoClasses;
 
 #[derive(Debug)]
-pub struct StyleSheet<'i> {
-  pub rules: CssRuleList<'i>,
+pub struct StyleSheet<'i, T, R> {
+  pub rules: CssRuleList<'i, R>,
   pub sources: Vec<String>,
-  options: ParserOptions
+  options: ParserOptions<T>
 }
 
 #[derive(Default)]
@@ -44,8 +44,8 @@ pub struct ToCssResult {
   pub dependencies: Option<Vec<Dependency>>
 }
 
-impl<'i> StyleSheet<'i> {
-  pub fn new(sources: Vec<String>, rules: CssRuleList, options: ParserOptions) -> StyleSheet {
+impl<'i, T: AtRuleParser<'i>> StyleSheet<'i, T, T::AtRule> where T::AtRule: cssparser::ToCss {
+  pub fn new(sources: Vec<String>, rules: CssRuleList<'i, T::AtRule>, options: ParserOptions<T>) -> Self {
     StyleSheet {
       sources,
       rules,
@@ -53,10 +53,10 @@ impl<'i> StyleSheet<'i> {
     }
   }
 
-  pub fn parse(filename: String, code: &'i str, options: ParserOptions) -> Result<StyleSheet<'i>, Error<ParserError<'i>>> {
+  pub fn parse(filename: String, code: &'i str, mut options: ParserOptions<T>) -> Result<Self, Error<ParserError<'i>>> {
     let mut input = ParserInput::new(&code);
     let mut parser = Parser::new(&mut input);
-    let rule_list_parser = RuleListParser::new_for_stylesheet(&mut parser, TopLevelRuleParser::new(&options));
+    let rule_list_parser = RuleListParser::new_for_stylesheet(&mut parser, TopLevelRuleParser::new(&mut options));
 
     let mut rules = vec![];
     for rule in rule_list_parser {
