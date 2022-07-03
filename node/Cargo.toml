@@ -20,8 +20,12 @@ parcel_sourcemap = "2.0.2"
 jemallocator = { version = "0.3.2", features = ["disable_initial_exec_tls"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-napi = {version = "2.2.0", default-features = false, features = ["napi4", "compat-mode", "serde-json"]}
+async-trait = "0.1.53"
+callback-future = "0.1"
+futures = "0.3.21"
+napi = {version = "2.2.0", default-features = false, features = ["napi5", "compat-mode", "serde-json", "tokio_rt"]}
 napi-derive = "2"
+tokio = {version = "1.19.0", features = ["rt", "rt-multi-thread"]}
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = "0.3"

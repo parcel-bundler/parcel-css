@@ -932,7 +932,6 @@ const DEFAULT_SYSTEM_FONTS: &[&str] = &[
 /// This list is an attempt at providing that support
 #[inline]
 fn compatible_font_family(mut family: Option<Vec<FontFamily>>, is_supported: bool) -> Option<Vec<FontFamily>> {
-
   if is_supported {
     return family;
   }

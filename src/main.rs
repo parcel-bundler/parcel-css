@@ -55,7 +55,8 @@ struct SourceMapJson<'a> {
   names: &'a Vec<String>,
 }
 
-pub fn main() -> Result<(), std::io::Error> {
+#[tokio::main]
+pub async fn main() -> Result<(), std::io::Error> {
   let cli_args = CliArgs::parse();
   let source = fs::read_to_string(&cli_args.input_file)?;
 
@@ -101,7 +102,7 @@ pub fn main() -> Result<(), std::io::Error> {
 
   let mut stylesheet = if cli_args.bundle {
     let mut bundler = Bundler::new(&fs, source_map.as_mut(), options);
-    bundler.bundle(Path::new(&cli_args.input_file)).unwrap()
+    bundler.bundle(Path::new(&cli_args.input_file)).await.unwrap()
   } else {
     if let Some(sm) = &mut source_map {
       sm.add_source(&filename);

@@ -18,9 +18,11 @@
 //!   stylesheet::ParserOptions
 //! };
 //!
-//! let fs = FileProvider::new();
-//! let mut bundler = Bundler::new(&fs, None, ParserOptions::default());
-//! let stylesheet = bundler.bundle(Path::new("style.css")).unwrap();
+//! async {
+//!   let fs = FileProvider::new();
+//!   let mut bundler = Bundler::new(&fs, None, ParserOptions::default());
+//!   let stylesheet = bundler.bundle(Path::new("style.css")).await.unwrap();
+//! };
 //! ```
 
 use crate::{
@@ -41,13 +43,16 @@ use crate::{
   },
   stylesheet::{ParserOptions, StyleSheet},
 };
+use async_recursion::async_recursion;
+use async_trait::async_trait;
 use dashmap::DashMap;
+use futures::future;
 use parcel_sourcemap::SourceMap;
-use rayon::prelude::*;
 use serde::Serialize;
 use std::{
   collections::HashSet,
   fs,
+  ops::DerefMut,
   path::{Path, PathBuf},
   sync::Mutex,
 };
@@ -78,13 +83,14 @@ struct BundleStyleSheet<'i, 'o> {
 ///
 /// See [FileProvider](FileProvider) for an implementation that uses the
 /// file system.
+#[async_trait]
 pub trait SourceProvider: Send + Sync {
   /// Reads the contents of the given file path to a string.
-  fn read<'a>(&'a self, file: &Path) -> std::io::Result<&'a str>;
+  async fn read<'a>(&'a self, file: &Path) -> std::io::Result<&'a str>;
 
   /// Resolves the given import specifier to a file path given the file
   /// which the import originated from.
-  fn resolve(&self, specifier: &str, originating_file: &Path) -> Result<PathBuf, Error<BundleErrorKind>>;
+  async fn resolve(&self, specifier: &str, originating_file: &Path) -> Result<PathBuf, Error<BundleErrorKind>>;
 }
 
 /// Provides an implementation of [SourceProvider](SourceProvider)
@@ -105,8 +111,9 @@ impl FileProvider {
 unsafe impl Sync for FileProvider {}
 unsafe impl Send for FileProvider {}
 
+#[async_trait]
 impl SourceProvider for FileProvider {
-  fn read<'a>(&'a self, file: &Path) -> std::io::Result<&'a str> {
+  async fn read<'a>(&'a self, file: &Path) -> std::io::Result<&'a str> {
     let source = fs::read_to_string(file)?;
     let ptr = Box::into_raw(Box::new(source));
     self.inputs.lock().unwrap().push(ptr);
@@ -116,7 +123,7 @@ impl SourceProvider for FileProvider {
     Ok(unsafe { &*ptr })
   }
 
-  fn resolve(&self, specifier: &str, originating_file: &Path) -> Result<PathBuf, Error<BundleErrorKind>> {
+  async fn resolve(&self, specifier: &str, originating_file: &Path) -> Result<PathBuf, Error<BundleErrorKind>> {
     // Assume the specifier is a releative file path and join it with current path.
     Ok(originating_file.with_file_name(specifier))
   }
@@ -190,22 +197,24 @@ impl<'a, 'o, 's, P: SourceProvider> Bundler<'a, 'o, 's, P> {
   }
 
   /// Bundles the given entry file and all dependencies into a single style sheet.
-  pub fn bundle<'e>(&mut self, entry: &'e Path) -> Result<StyleSheet<'a, 'o>, Error<BundleErrorKind<'a>>> {
+  pub async fn bundle<'e>(&mut self, entry: &'e Path) -> Result<StyleSheet<'a, 'o>, Error<BundleErrorKind<'a>>> {
     // Phase 1: load and parse all files. This is done in parallel.
-    self.load_file(
-      &entry,
-      ImportRule {
-        url: "".into(),
-        layer: None,
-        supports: None,
-        media: MediaList::new(),
-        loc: Location {
-          source_index: 0,
-          line: 0,
-          column: 1,
+    self
+      .load_file(
+        &entry,
+        ImportRule {
+          url: "".into(),
+          layer: None,
+          supports: None,
+          media: MediaList::new(),
+          loc: Location {
+            source_index: 0,
+            line: 0,
+            column: 1,
+          },
         },
-      },
-    )?;
+      )
+      .await?;
 
     // Phase 2: determine the order that the files should be concatenated.
     self.order();
@@ -231,79 +240,84 @@ impl<'a, 'o, 's, P: SourceProvider> Bundler<'a, 'o, 's, P> {
     entry.key().to_str().unwrap().into()
   }
 
-  fn load_file(&self, file: &Path, rule: ImportRule<'a>) -> Result<u32, Error<BundleErrorKind<'a>>> {
-    // Check if we already loaded this file.
-    let mut stylesheets = self.stylesheets.lock().unwrap();
-    let source_index = match self.source_indexes.get(file) {
-      Some(source_index) => {
-        // If we already loaded this file, combine the media queries and supports conditions
-        // from this import rule with the existing ones using a logical or operator.
-        let entry = &mut stylesheets[*source_index as usize];
+  #[async_recursion]
+  async fn load_file(&self, file: &Path, rule: ImportRule<'a>) -> Result<u32, Error<BundleErrorKind<'a>>> {
+    let source_index = {
+      // Check if we already loaded this file.
+      let mut stylesheets = self.stylesheets.lock().unwrap();
+      let source_index = match self.source_indexes.get(file) {
+        Some(source_index) => {
+          // If we already loaded this file, combine the media queries and supports conditions
+          // from this import rule with the existing ones using a logical or operator.
+          let entry = &mut stylesheets[*source_index as usize];
 
-        // We cannot combine a media query and a supports query from different @import rules.
-        // e.g. @import "a.css" print; @import "a.css" supports(color: red);
-        // This would require duplicating the actual rules in the file.
-        if (!rule.media.media_queries.is_empty() && !entry.supports.is_none())
-          || (!entry.media.media_queries.is_empty() && !rule.supports.is_none())
-        {
-          return Err(Error {
-            kind: BundleErrorKind::UnsupportedImportCondition,
-            loc: Some(ErrorLocation::new(rule.loc, self.find_filename(rule.loc.source_index))),
-          });
-        }
-
-        if rule.media.media_queries.is_empty() {
-          entry.media.media_queries.clear();
-        } else if !entry.media.media_queries.is_empty() {
-          entry.media.or(&rule.media);
-        }
-
-        if let Some(supports) = rule.supports {
-          if let Some(existing_supports) = &mut entry.supports {
-            existing_supports.or(&supports)
+          // We cannot combine a media query and a supports query from different @import rules.
+          // e.g. @import "a.css" print; @import "a.css" supports(color: red);
+          // This would require duplicating the actual rules in the file.
+          if (!rule.media.media_queries.is_empty() && !entry.supports.is_none())
+            || (!entry.media.media_queries.is_empty() && !rule.supports.is_none())
+          {
+            return Err(Error {
+              kind: BundleErrorKind::UnsupportedImportCondition,
+              loc: Some(ErrorLocation::new(rule.loc, self.find_filename(rule.loc.source_index))),
+            });
           }
-        } else {
-          entry.supports = None;
-        }
 
-        if let Some(layer) = &rule.layer {
-          if let Some(existing_layer) = &entry.layer {
-            // We can't OR layer names without duplicating all of the nested rules, so error for now.
-            if layer != existing_layer || (layer.is_none() && existing_layer.is_none()) {
-              return Err(Error {
-                kind: BundleErrorKind::UnsupportedLayerCombination,
-                loc: Some(ErrorLocation::new(rule.loc, self.find_filename(rule.loc.source_index))),
-              });
+          if rule.media.media_queries.is_empty() {
+            entry.media.media_queries.clear();
+          } else if !entry.media.media_queries.is_empty() {
+            entry.media.or(&rule.media);
+          }
+
+          if let Some(supports) = rule.supports {
+            if let Some(existing_supports) = &mut entry.supports {
+              existing_supports.or(&supports)
             }
           } else {
-            entry.layer = rule.layer;
+            entry.supports = None;
           }
+
+          if let Some(layer) = &rule.layer {
+            if let Some(existing_layer) = &entry.layer {
+              // We can't OR layer names without duplicating all of the nested rules, so error for now.
+              if layer != existing_layer || (layer.is_none() && existing_layer.is_none()) {
+                return Err(Error {
+                  kind: BundleErrorKind::UnsupportedLayerCombination,
+                  loc: Some(ErrorLocation::new(rule.loc, self.find_filename(rule.loc.source_index))),
+                });
+              }
+            } else {
+              entry.layer = rule.layer;
+            }
+          }
+
+          return Ok(*source_index);
         }
+        None => {
+          let source_index = stylesheets.len() as u32;
+          self.source_indexes.insert(file.to_owned(), source_index);
 
-        return Ok(*source_index);
-      }
-      None => {
-        let source_index = stylesheets.len() as u32;
-        self.source_indexes.insert(file.to_owned(), source_index);
+          stylesheets.push(BundleStyleSheet {
+            stylesheet: None,
+            layer: rule.layer.clone(),
+            media: rule.media.clone(),
+            supports: rule.supports.clone(),
+            loc: rule.loc.clone(),
+            dependencies: Vec::new(),
+            parent_source_index: 0,
+            parent_dep_index: 0,
+          });
 
-        stylesheets.push(BundleStyleSheet {
-          stylesheet: None,
-          layer: rule.layer.clone(),
-          media: rule.media.clone(),
-          supports: rule.supports.clone(),
-          loc: rule.loc.clone(),
-          dependencies: Vec::new(),
-          parent_source_index: 0,
-          parent_dep_index: 0,
-        });
+          source_index
+        }
+      };
 
-        source_index
-      }
+      // Return just `source_index` so `stylesheets` falls out of scope and doesn't cross
+      // an `await` boundary, which would violate `Send` requirements.
+      source_index
     };
 
-    drop(stylesheets); // ensure we aren't holding the lock anymore
-
-    let code = self.fs.read(file).map_err(|e| Error {
+    let code = self.fs.read(file).await.map_err(|e| Error {
       kind: BundleErrorKind::IOError(e),
       loc: Some(ErrorLocation::new(rule.loc, self.find_filename(rule.loc.source_index))),
     })?;
@@ -321,21 +335,21 @@ impl<'a, 'o, 's, P: SourceProvider> Bundler<'a, 'o, 's, P> {
     let mut stylesheet = StyleSheet::parse(filename, code, opts)?;
 
     // Collect and load dependencies for this stylesheet in parallel.
-    let dependencies: Result<Vec<u32>, _> = stylesheet
-      .rules
-      .0
-      .par_iter_mut()
-      .filter_map(|r| {
+    let dependencies: Result<Vec<u32>, _> = future::join_all(stylesheet.rules.0.iter_mut().map(|r| async {
+      // Wrap in an async-compatible Mutex so we can easily pass it across `await` boundaries.
+      let mutex = futures::lock::Mutex::new(r);
+      let result = match mutex.lock().await.deref_mut() {
         // Prepend parent layer name to @layer statements.
-        if let CssRule::LayerStatement(layer) = r {
+        CssRule::LayerStatement(layer) => {
           if let Some(Some(parent_layer)) = &rule.layer {
             for name in &mut layer.names {
               name.0.insert_many(0, parent_layer.0.iter().cloned())
             }
           }
-        }
 
-        if let CssRule::Import(import) = r {
+          None
+        }
+        CssRule::Import(import) => {
           let specifier = &import.url;
 
           // Combine media queries and supports conditions from parent
@@ -376,17 +390,21 @@ impl<'a, 'o, 's, P: SourceProvider> Bundler<'a, 'o, 's, P> {
             import.layer.clone()
           };
 
-          let result = match self.fs.resolve(&specifier, file) {
-            Ok(path) => self.load_file(
-              &path,
-              ImportRule {
-                layer,
-                media,
-                supports: combine_supports(rule.supports.clone(), &import.supports),
-                url: "".into(),
-                loc: import.loc,
-              },
-            ),
+          let result = match self.fs.resolve(&specifier, file).await {
+            Ok(path) => {
+              self
+                .load_file(
+                  &path,
+                  ImportRule {
+                    layer,
+                    media,
+                    supports: combine_supports(rule.supports.clone(), &import.supports),
+                    url: "".into(),
+                    loc: import.loc,
+                  },
+                )
+                .await
+            }
             Err(err) => Err(Error {
               kind: err.kind,
               loc: Some(ErrorLocation::new(
@@ -397,11 +415,15 @@ impl<'a, 'o, 's, P: SourceProvider> Bundler<'a, 'o, 's, P> {
           };
 
           Some(result)
-        } else {
-          None
         }
-      })
-      .collect();
+        _ => None,
+      };
+      result
+    }))
+    .await
+    .into_iter()
+    .filter_map(|value| value)
+    .collect();
 
     let entry = &mut self.stylesheets.lock().unwrap()[source_index as usize];
     entry.stylesheet = Some(stylesheet);
@@ -529,12 +551,13 @@ mod tests {
     map: HashMap<PathBuf, String>,
   }
 
+  #[async_trait]
   impl SourceProvider for TestProvider {
-    fn read<'a>(&'a self, file: &Path) -> std::io::Result<&'a str> {
+    async fn read<'a>(&'a self, file: &Path) -> std::io::Result<&'a str> {
       Ok(self.map.get(file).unwrap())
     }
 
-    fn resolve(&self, specifier: &str, originating_file: &Path) -> Result<PathBuf, Error<BundleErrorKind>> {
+    async fn resolve(&self, specifier: &str, originating_file: &Path) -> Result<PathBuf, Error<BundleErrorKind>> {
       Ok(originating_file.with_file_name(specifier))
     }
   }
@@ -544,15 +567,16 @@ mod tests {
     map: HashMap<PathBuf, String>,
   }
 
+  #[async_trait]
   impl SourceProvider for CustomProvider {
     /// Read files from in-memory map.
-    fn read<'a>(&'a self, file: &Path) -> std::io::Result<&'a str> {
+    async fn read<'a>(&'a self, file: &Path) -> std::io::Result<&'a str> {
       Ok(self.map.get(file).unwrap())
     }
 
     /// Resolve by stripping a `foo:` prefix off any import. Specifiers without
     /// this prefix fail with an error.
-    fn resolve(&self, specifier: &str, _originating_file: &Path) -> Result<PathBuf, Error<BundleErrorKind>> {
+    async fn resolve(&self, specifier: &str, _originating_file: &Path) -> Result<PathBuf, Error<BundleErrorKind>> {
       if specifier.starts_with("foo:") {
         Ok(Path::new(&specifier["foo:".len()..]).to_path_buf())
       } else {
@@ -582,13 +606,13 @@ mod tests {
     };
   );
 
-  fn bundle<P: SourceProvider>(fs: P, entry: &str) -> String {
+  async fn bundle<P: SourceProvider>(fs: P, entry: &str) -> String {
     let mut bundler = Bundler::new(&fs, None, ParserOptions::default());
-    let stylesheet = bundler.bundle(Path::new(entry)).unwrap();
+    let stylesheet = bundler.bundle(Path::new(entry)).await.unwrap();
     stylesheet.to_css(PrinterOptions::default()).unwrap().code
   }
 
-  fn bundle_css_module<P: SourceProvider>(fs: P, entry: &str) -> String {
+  async fn bundle_css_module<P: SourceProvider>(fs: P, entry: &str) -> String {
     let mut bundler = Bundler::new(
       &fs,
       None,
@@ -597,11 +621,11 @@ mod tests {
         ..ParserOptions::default()
       },
     );
-    let stylesheet = bundler.bundle(Path::new(entry)).unwrap();
+    let stylesheet = bundler.bundle(Path::new(entry)).await.unwrap();
     stylesheet.to_css(PrinterOptions::default()).unwrap().code
   }
 
-  fn bundle_custom_media<P: SourceProvider>(fs: P, entry: &str) -> String {
+  async fn bundle_custom_media<P: SourceProvider>(fs: P, entry: &str) -> String {
     let mut bundler = Bundler::new(
       &fs,
       None,
@@ -610,7 +634,7 @@ mod tests {
         ..ParserOptions::default()
       },
     );
-    let mut stylesheet = bundler.bundle(Path::new(entry)).unwrap();
+    let mut stylesheet = bundler.bundle(Path::new(entry)).await.unwrap();
     let targets = Some(Browsers {
       safari: Some(13 << 16),
       ..Browsers::default()
@@ -630,9 +654,13 @@ mod tests {
       .code
   }
 
-  fn error_test<P: SourceProvider>(fs: P, entry: &str, maybe_cb: Option<Box<dyn FnOnce(BundleErrorKind) -> ()>>) {
+  async fn error_test<P: SourceProvider>(
+    fs: P,
+    entry: &str,
+    maybe_cb: Option<Box<dyn FnOnce(BundleErrorKind) -> ()>>,
+  ) {
     let mut bundler = Bundler::new(&fs, None, ParserOptions::default());
-    let res = bundler.bundle(Path::new(entry));
+    let res = bundler.bundle(Path::new(entry)).await;
     match res {
       Ok(_) => unreachable!(),
       Err(e) => {
@@ -643,8 +671,8 @@ mod tests {
     }
   }
 
-  #[test]
-  fn test_bundle() {
+  #[tokio::test]
+  async fn test_bundle() {
     let res = bundle(
       TestProvider {
         map: fs! {
@@ -658,7 +686,8 @@ mod tests {
         },
       },
       "/a.css",
-    );
+    )
+    .await;
     assert_eq!(
       res,
       indoc! { r#"
@@ -685,7 +714,8 @@ mod tests {
         },
       },
       "/a.css",
-    );
+    )
+    .await;
     assert_eq!(
       res,
       indoc! { r#"
@@ -714,7 +744,8 @@ mod tests {
         },
       },
       "/a.css",
-    );
+    )
+    .await;
     assert_eq!(
       res,
       indoc! { r#"
@@ -743,7 +774,8 @@ mod tests {
         },
       },
       "/a.css",
-    );
+    )
+    .await;
     assert_eq!(
       res,
       indoc! { r#"
@@ -775,7 +807,8 @@ mod tests {
         },
       },
       "/a.css",
-    );
+    )
+    .await;
     assert_eq!(
       res,
       indoc! { r#"
@@ -805,7 +838,8 @@ mod tests {
         },
       },
       "/a.css",
-    );
+    )
+    .await;
     assert_eq!(
       res,
       indoc! { r#"
@@ -838,7 +872,8 @@ mod tests {
         },
       },
       "/a.css",
-    );
+    )
+    .await;
     assert_eq!(
       res,
       indoc! { r#"
@@ -877,7 +912,8 @@ mod tests {
         },
       },
       "/a.css",
-    );
+    )
+    .await;
     assert_eq!(
       res,
       indoc! { r#"
@@ -904,7 +940,8 @@ mod tests {
         },
       },
       "/a.css",
-    );
+    )
+    .await;
     assert_eq!(
       res,
       indoc! { r#"
@@ -931,7 +968,8 @@ mod tests {
         },
       },
       "/a.css",
-    );
+    )
+    .await;
     assert_eq!(
       res,
       indoc! { r#"
@@ -958,7 +996,8 @@ mod tests {
         },
       },
       "/a.css",
-    );
+    )
+    .await;
     assert_eq!(
       res,
       indoc! { r#"
@@ -991,7 +1030,8 @@ mod tests {
         },
       },
       "/a.css",
-    );
+    )
+    .await;
     assert_eq!(
       res,
       indoc! { r#"
@@ -1020,7 +1060,8 @@ mod tests {
         },
       },
       "/a.css",
-    );
+    )
+    .await;
     assert_eq!(
       res,
       indoc! { r#"
@@ -1049,7 +1090,8 @@ mod tests {
         },
       },
       "/a.css",
-    );
+    )
+    .await;
     assert_eq!(
       res,
       indoc! { r#"
@@ -1082,7 +1124,8 @@ mod tests {
         },
       },
       "/a.css",
-    );
+    )
+    .await;
     assert_eq!(
       res,
       indoc! { r#"
@@ -1117,7 +1160,8 @@ mod tests {
         },
       },
       "/a.css",
-    );
+    )
+    .await;
     assert_eq!(
       res,
       indoc! { r#"
@@ -1160,7 +1204,8 @@ mod tests {
         },
       },
       "/a.css",
-    );
+    )
+    .await;
     assert_eq!(
       res,
       indoc! { r#"
@@ -1205,7 +1250,8 @@ mod tests {
       Some(Box::new(|err| {
         assert!(matches!(err, BundleErrorKind::UnsupportedLayerCombination));
       })),
-    );
+    )
+    .await;
 
     error_test(
       TestProvider {
@@ -1223,7 +1269,8 @@ mod tests {
       Some(Box::new(|err| {
         assert!(matches!(err, BundleErrorKind::UnsupportedLayerCombination));
       })),
-    );
+    )
+    .await;
 
     error_test(
       TestProvider {
@@ -1245,7 +1292,8 @@ mod tests {
       Some(Box::new(|err| {
         assert!(matches!(err, BundleErrorKind::UnsupportedLayerCombination));
       })),
-    );
+    )
+    .await;
 
     error_test(
       TestProvider {
@@ -1267,7 +1315,8 @@ mod tests {
       Some(Box::new(|err| {
         assert!(matches!(err, BundleErrorKind::UnsupportedLayerCombination));
       })),
-    );
+    )
+    .await;
 
     let res = bundle(
       TestProvider {
@@ -1293,7 +1342,8 @@ mod tests {
         },
       },
       "/index.css",
-    );
+    )
+    .await;
     assert_eq!(
       res,
       indoc! { r#"
@@ -1329,7 +1379,8 @@ mod tests {
         },
       },
       "/index.css",
-    );
+    )
+    .await;
     assert_eq!(
       res,
       indoc! { r#"
@@ -1354,7 +1405,8 @@ mod tests {
         },
       },
       "/a.css",
-    );
+    )
+    .await;
     assert_eq!(
       res,
       indoc! { r#"
@@ -1390,7 +1442,8 @@ mod tests {
           .to_string()
           .contains("Failed to resolve `/b.css`, specifier does not start with `foo:`."));
       })),
-    );
+    )
+    .await;
 
     // let res = bundle(fs! {
     //   "/a.css": r#"
@@ -1401,7 +1454,7 @@ mod tests {
     //   "/b.css": r#"
     //     .b { color: green }
     //   "#
-    // }, "/a.css");
+    // }, "/a.css").await;
 
     // let res = bundle(fs! {
     //   "/a.css": r#"
@@ -1415,6 +1468,6 @@ mod tests {
     //   "/c.css": r#"
     //     .c { color: yellow }
     //   "#
-    // }, "/a.css");
+    // }, "/a.css").await;
   }
 }

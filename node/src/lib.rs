@@ -2,6 +2,7 @@
 #[global_allocator]
 static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
+use async_trait::async_trait;
 use parcel_css::bundler::{BundleErrorKind, Bundler, FileProvider, SourceProvider};
 use parcel_css::css_modules::{CssModuleExports, CssModuleReferences, PatternParseError};
 use parcel_css::dependencies::Dependency;
@@ -12,8 +13,14 @@ use parcel_css::stylesheet::{
 use parcel_css::targets::Browsers;
 use parcel_sourcemap::SourceMap;
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::Mutex;
+use tokio::runtime::Runtime;
+
+use callback_future::CallbackFuture;
 
 // ---------------------------------------------
 
@@ -45,7 +52,11 @@ pub fn transform_style_attribute(config_val: JsValue) -> Result<JsValue, JsValue
 // ---------------------------------------------
 
 #[cfg(not(target_arch = "wasm32"))]
-use napi::{CallContext, JsObject, JsUnknown};
+use napi::threadsafe_function::{
+  ErrorStrategy, ThreadSafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use napi::{CallContext, JsFunction, JsObject, JsUnknown};
 #[cfg(not(target_arch = "wasm32"))]
 use napi_derive::{js_function, module_exports};
 
@@ -127,9 +138,20 @@ fn transform_style_attribute(ctx: CallContext) -> napi::Result<JsUnknown> {
 #[js_function(1)]
 fn bundle(ctx: CallContext) -> napi::Result<JsUnknown> {
   let opts = ctx.get::<JsObject>(0)?;
-  let config: BundleConfig = ctx.env.from_js_value(opts)?;
+  let config: BundleConfig = ctx.env.from_js_value(&opts)?;
+
+  // Throw early error if user mistakenly passes `resolver` into synchronous `bundle()`.
+  let resolver = opts.get::<&str, JsUnknown>("resolver")?;
+  if resolver.is_some() {
+    return Err(napi::Error::new(
+      napi::Status::InvalidArg,
+      "`bundle()` doesn't support custom JS resolvers but received a `resolver` property. Use `bundleAsync()` instead.".to_owned()),
+    );
+  }
+
   let fs = FileProvider::new();
-  let res = compile_bundle(&fs, &config);
+  let async_runtime = Runtime::new()?;
+  let res = async_runtime.block_on(compile_bundle(&fs, &config));
 
   match res {
     Ok(res) => res.into_js(ctx),
@@ -150,10 +172,334 @@ fn bundle(ctx: CallContext) -> napi::Result<JsUnknown> {
         | CompileError::BundleError(Error {
           loc: Some(ErrorLocation { filename, .. }),
           ..
-        }) => Some(fs.read(Path::new(filename))?),
+        }) => Some(async_runtime.block_on(fs.read(Path::new(filename)))?),
         _ => None,
       };
       err.throw(ctx, code)
+    }
+  }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[js_function(1)]
+fn bundle_async(ctx: CallContext) -> napi::Result<JsObject> {
+  // Parse JS arguments into Rust values so they can be used in the `Future`.
+  let opts = ctx.get::<JsObject>(0)?;
+  let config: BundleConfig = ctx.env.from_js_value(&opts)?;
+
+  // Get `read()` and `resolve()` JS functions.
+  let maybe_resolver = &opts.get::<&str, JsObject>("resolver")?;
+  let maybe_unsafe_read = match &maybe_resolver {
+    None => None,
+    Some(resolver) => match resolver.get::<&str, JsUnknown>("read")? {
+      None => None,
+      Some(read) => {
+        let read_type = read.get_type().unwrap();
+        if read_type != napi::ValueType::Function {
+          return Err(napi::Error::new(
+            napi::Status::FunctionExpected,
+            format!(
+              "Expected `resolver.read` to be of type `{}` but was of type `{}`",
+              napi::ValueType::Function,
+              read_type
+            ),
+          ));
+        }
+
+        Some(unsafe { read.cast::<JsFunction>() })
+      }
+    },
+  };
+  let maybe_unsafe_resolve = match &maybe_resolver {
+    None => None,
+    Some(resolver) => match resolver.get::<&str, JsUnknown>("resolve")? {
+      None => None,
+      Some(resolve) => {
+        let resolve_type = resolve.get_type().unwrap();
+        if resolve_type != napi::ValueType::Function {
+          return Err(napi::Error::new(
+            napi::Status::FunctionExpected,
+            format!(
+              "Expected `resolver.resolve` to be of type `{}` but was of type `{}`.",
+              napi::ValueType::Function,
+              resolve_type
+            ),
+          ));
+        }
+
+        Some(unsafe { resolve.cast::<JsFunction>() })
+      }
+    },
+  };
+
+  // Map `read()` and `resolve()` to thread-safe N-API functions.
+  let maybe_read: Option<ThreadsafeFunction<ReadArgs, ErrorStrategy::Fatal>> = match maybe_unsafe_read {
+    None => None,
+    Some(unsafe_read) => Some(unsafe_read.create_threadsafe_function(
+      0, /* max_queue_size */
+      // On the main thread, convert Rust args struct into JS arguments.
+      |ctx: ThreadSafeCallContext<ReadArgs>| {
+        Ok(vec![
+          ctx.env.create_string(&ctx.value.file.to_str().unwrap())?.into_unknown(),
+          ctx
+            .env
+            .create_function_from_closure("callback", ctx.value.callback)?
+            .into_unknown(),
+        ])
+      },
+    )?),
+  };
+  let maybe_resolve = match maybe_unsafe_resolve {
+    None => None,
+    Some(unsafe_resolve) => Some(unsafe_resolve.create_threadsafe_function(
+      0, /* max_queue_size */
+      // On the main thread, convert Rust args struct into JS arguments.
+      |ctx: ThreadSafeCallContext<ResolveArgs>| {
+        Ok(vec![
+          ctx.env.create_string(&ctx.value.specifier)?.into_unknown(),
+          ctx
+            .env
+            .create_string(ctx.value.originating_file.to_str().unwrap())?
+            .into_unknown(),
+          ctx
+            .env
+            .create_function_from_closure("callback", ctx.value.callback)?
+            .into_unknown(),
+        ])
+      },
+    )?),
+  };
+
+  // Execute asynchronous operation and return a `Promise` to JS.
+  ctx.env.execute_tokio_future(
+    // Perform asynchronous work, *cannot* access JS data from here.
+    async {
+      let source_provider = JsSourceProvider::new(FileProvider::new(), maybe_read, maybe_resolve);
+      let res = compile_bundle(&source_provider, &config).await;
+      drop(config);
+
+      match res {
+        Ok(transform_result) => Ok(transform_result),
+        Err(compile_error) => Err(napi::Error::new(
+          napi::Status::GenericFailure,
+          compile_error.to_string(),
+        )),
+      }
+    },
+    // Convert the result from Rust data to JS data.
+    |&mut env, transform_result| env.to_js_value(&transform_result),
+  )
+}
+
+/// Arguments passed to the JS custom read function.
+struct ReadArgs {
+  file: PathBuf,
+  callback: Box<dyn Fn(CallContext) -> napi::Result<napi::JsUndefined> + Send>,
+}
+
+/// Arguments passed to the JS custom resolve function.
+struct ResolveArgs {
+  specifier: String,
+  originating_file: PathBuf,
+  callback: Box<dyn Fn(CallContext) -> napi::Result<napi::JsUndefined> + Send>,
+}
+
+/// Buffer containing cached source inputs. This wrapper struct is only necessary to be
+/// marked `Send` so it can be used with a `static` lifetime as required by
+/// `ThreadsafeFunction`. Since `JsSourceProvider` uses this in an `Arc<Mutex<Buffer>>`
+/// This can outlive the `JsSourceProvider` if necessary.
+struct InputCache {
+  inputs: Vec<*mut String>,
+}
+
+unsafe impl Send for InputCache {}
+
+impl Drop for InputCache {
+  fn drop(&mut self) {
+    for ptr in self.inputs.iter() {
+      std::mem::drop(unsafe { Box::from_raw(*ptr) });
+    }
+  }
+}
+
+/// A `SourceProvider` implementation which uses JS implementations where given, falling
+/// back to a wrapped `SourceProvider` where not given.
+struct JsSourceProvider<P>
+where
+  P: SourceProvider,
+{
+  /// Buffer with cached source files.
+  cache: Arc<Mutex<InputCache>>,
+
+  /// Fallback provider to use when no custom JS implementation is available for an
+  /// operation.
+  fallback_provider: P,
+
+  /// Custom JS `read()` function.
+  maybe_read: Option<ThreadsafeFunction<ReadArgs, ErrorStrategy::Fatal>>,
+
+  /// Custom JS `resolve()` function.
+  maybe_resolve: Option<ThreadsafeFunction<ResolveArgs, ErrorStrategy::Fatal>>,
+}
+
+impl<P: SourceProvider> JsSourceProvider<P> {
+  /// Creates a new `JsSourceProvider`.
+  fn new(
+    fallback_provider: P,
+    maybe_read: Option<ThreadsafeFunction<ReadArgs, ErrorStrategy::Fatal>>,
+    maybe_resolve: Option<ThreadsafeFunction<ResolveArgs, ErrorStrategy::Fatal>>,
+  ) -> JsSourceProvider<P> {
+    JsSourceProvider {
+      cache: Arc::new(Mutex::new(InputCache { inputs: Vec::new() })),
+      fallback_provider,
+      maybe_read,
+      maybe_resolve,
+    }
+  }
+}
+
+// JS implementations use thread-safe functions, so `JsSourceProvider` is thread-safe as
+// long as the fallback provider is also thread-safe.
+unsafe impl<P: SourceProvider + Send> Send for JsSourceProvider<P> {}
+unsafe impl<P: SourceProvider + Sync> Sync for JsSourceProvider<P> {}
+
+#[async_trait]
+impl<P: SourceProvider> SourceProvider for JsSourceProvider<P> {
+  async fn read<'a>(&'a self, file: &Path) -> std::io::Result<&'a str> {
+    let cache = self.cache.clone();
+    match self.maybe_read.clone() {
+      // Use fallback provider if no JS `read()` implementation exists.
+      None => self.fallback_provider.read(file).await,
+      // Use JS `read()` implementation.
+      Some(read) => {
+        let file = file.to_owned();
+
+        // Wait until JS calls back with the result.
+        CallbackFuture::<std::io::Result<&str>>::new(move |complete| {
+          // `complete` can only be called once, but JS could invoke this callback
+          // multiple times. Use a `Cell` to hide the mutability and restrict it to
+          // only be called once.
+          let complete = Cell::new(Some(complete));
+
+          // Invoke the JS `read()` function.
+          read.call(ReadArgs {
+            file,
+            // JS invokes this callback with the result. It follows Node async
+            // conventions (`cb(error, result)`).
+            callback: Box::new(move |ctx| {
+              // Get completion callback. This function can only be called once by JS
+              // so any subsequent executions should error immediately.
+              let complete = complete.take().ok_or(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Callback invoked twice.",
+              ))?;
+
+              // Validate no errors were thrown.
+              let error = ctx.get::<JsUnknown>(0)?;
+              let error_type = error.get_type()?;
+              if error_type != napi::ValueType::Null && error_type != napi::ValueType::Undefined {
+                complete(Err(std::io::Error::new(std::io::ErrorKind::Other, format!(
+                  "`read()` threw error:\n{}",
+                  error.coerce_to_string()?.into_utf8()?.as_str()?.to_owned(),
+                ))));
+                return ctx.env.get_undefined();
+              }
+
+              // Validate that result was a string.
+              let result = ctx.get::<JsUnknown>(1)?;
+              let result_type = result.get_type()?;
+              if result_type != napi::ValueType::String {
+                complete(Err(std::io::Error::new(std::io::ErrorKind::Other, format!(
+                  "Expected `read()` to return a value of type `{}`, but it returned a value of type `{}` instead.", napi::ValueType::String, result_type,
+                ))));
+                return ctx.env.get_undefined();
+              }
+
+              // Get file contents and add to the source file cache.
+              let result = result.coerce_to_string()?.into_utf8()?.as_str()?.to_owned();
+              let ptr = Box::into_raw(Box::new(result));
+              cache.lock().unwrap().inputs.push(ptr);
+
+              // SAFETY: this is safe because the pointer is not dropped until the
+              // `JsSourceProvider` is, and we never remove from the list of pointers
+              // stored in the vector.
+              complete(Ok(unsafe { &*ptr }));
+
+              ctx.env.get_undefined()
+            }),
+          }, ThreadsafeFunctionCallMode::Blocking);
+        }).await
+      }
+    }
+  }
+
+  async fn resolve(&self, specifier: &str, originating_file: &Path) -> Result<PathBuf, Error<BundleErrorKind>> {
+    match self.maybe_resolve.clone() {
+      // Use fallback provider if no JS `resolve()` implementation exists.
+      None => self.fallback_provider.resolve(specifier, originating_file).await,
+      // Use JS `resolve()` implementation.
+      Some(resolve) => {
+        let specifier = specifier.to_owned();
+        let originating_file = originating_file.to_path_buf().to_owned();
+
+        // Wait until JS calls back with the result.
+        CallbackFuture::<Result<PathBuf, Error<BundleErrorKind>>>::new(move |complete| {
+          // `complete` can only be called once, but JS could invoke this callback
+          // multiple times. Use a `Cell` to hide the mutability and restrict it to
+          // only be called once.
+          let complete = Cell::new(Some(complete));
+
+          // Invoke the JS `resolve()` function.
+          resolve.call(ResolveArgs {
+            specifier,
+            originating_file,
+            // JS invokes this callback with the result.
+            callback: Box::new(move |ctx| {
+              // Get completion callback. This function can only be called once by JS
+              // so any subsequent executions should error immediately.
+              let complete = complete.take().ok_or(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Callback invoked twice.",
+              ))?;
+
+              // Check for error.
+              let error = ctx.get::<JsUnknown>(0)?;
+              let error_type = error.get_type()?;
+              if error_type != napi::ValueType::Null && error_type != napi::ValueType::Undefined {
+                complete(Err(Error {
+                  kind: BundleErrorKind::IOError(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("`resolve()` threw error:\n{}", error.coerce_to_string()?.into_utf8()?.as_str()?.to_owned()),
+                  )),
+                  loc: None,
+                }));
+                return ctx.env.get_undefined();
+              }
+
+              // Validate that result was a string.
+              let result = ctx.get::<JsUnknown>(1)?;
+              let result_type = result.get_type()?;
+              if result_type != napi::ValueType::String {
+                complete(Err(Error {
+                  kind: BundleErrorKind::IOError(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Expected `resolve()` to return a value of type `{}`, but it returned a value of type `{}` instead.", napi::ValueType::String, result_type),
+                  )),
+                  loc: None,
+                }));
+                return ctx.env.get_undefined();
+              }
+
+              // Convert JS string into a Rust `PathBuf`.
+              let resolved = result.coerce_to_string()?.into_utf8()?.as_str()?.to_owned();
+              let resolved = Path::new(&resolved).to_path_buf();
+              complete(Ok(resolved));
+
+              ctx.env.get_undefined()
+            }),
+          }, ThreadsafeFunctionCallMode::Blocking);
+        }).await
+      }
     }
   }
 }
@@ -164,6 +510,7 @@ fn init(mut exports: JsObject) -> napi::Result<()> {
   exports.create_named_method("transform", transform)?;
   exports.create_named_method("transformStyleAttribute", transform_style_attribute)?;
   exports.create_named_method("bundle", bundle)?;
+  exports.create_named_method("bundleAsync", bundle_async)?;
 
   Ok(())
 }
@@ -313,7 +660,10 @@ fn compile<'i>(code: &'i str, config: &Config) -> Result<TransformResult, Compil
   })
 }
 
-fn compile_bundle<'i>(fs: &'i FileProvider, config: &BundleConfig) -> Result<TransformResult, CompileError<'i>> {
+async fn compile_bundle<'i, P: SourceProvider>(
+  fs: &'i P,
+  config: &BundleConfig,
+) -> Result<TransformResult, CompileError<'i>> {
   let mut source_map = if config.source_map.unwrap_or(false) {
     Some(SourceMap::new("/"))
   } else {
@@ -347,7 +697,7 @@ fn compile_bundle<'i>(fs: &'i FileProvider, config: &BundleConfig) -> Result<Tra
   };
 
   let mut bundler = Bundler::new(fs, source_map.as_mut(), parser_options);
-  let mut stylesheet = bundler.bundle(Path::new(&config.filename))?;
+  let mut stylesheet = bundler.bundle(Path::new(&config.filename)).await?;
 
   stylesheet.minify(MinifyOptions {
     targets: config.targets,
